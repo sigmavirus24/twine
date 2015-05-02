@@ -90,6 +90,139 @@ def sign_file(sign_with, filename, identity):
     subprocess.check_call(gpg_args)
 
 
+def generate_md5sum_from(filename):
+    md5_hash = hashlib.md5()
+    with open(filename, "rb") as fp:
+        content = fp.read(4096)
+        while content:
+            md5_hash.update(content)
+            content = fp.read(4096)
+
+    return md5_hash.hexdigest()
+
+
+def generate_data(filename, meta, dtype, comment, action="file_upload"):
+    if dtype == "bdist_egg":
+        pkgd = pkg_resources.Distribution.from_filename(filename)
+        py_version = pkgd.py_version
+    elif dtype == "bdist_wheel":
+        py_version = meta.py_version
+    elif dtype == "bdist_wininst":
+        py_version = meta.py_version
+    else:
+        py_version = None
+
+    # Fill in the data - send all the meta-data in case we need to
+    # register a new release
+    return {
+        # action
+        ":action": action,
+        "protcol_version": "1",
+
+        # identify release
+        "name": pkg_resources.safe_name(meta.name),
+        "version": meta.version,
+
+        # file content
+        "filetype": dtype,
+        "pyversion": py_version,
+
+        # additional meta-data
+        "metadata_version": meta.metadata_version,
+        "summary": meta.summary,
+        "home_page": meta.home_page,
+        "author": meta.author,
+        "author_email": meta.author_email,
+        "maintainer": meta.maintainer,
+        "maintainer_email": meta.maintainer_email,
+        "license": meta.license,
+        "description": meta.description,
+        "keywords": meta.keywords,
+        "platform": meta.platforms,
+        "classifiers": meta.classifiers,
+        "download_url": meta.download_url,
+        "supported_platform": meta.supported_platforms,
+        "comment": comment,
+
+        # PEP 314
+        "provides": meta.provides,
+        "requires": meta.requires,
+        "obsoletes": meta.obsoletes,
+
+        # Metadata 1.2
+        "project_urls": meta.project_urls,
+        "provides_dist": meta.provides_dist,
+        "obsoletes_dist": meta.obsoletes_dist,
+        "requires_dist": meta.requires_dist,
+        "requires_external": meta.requires_external,
+        "requires_python": meta.requires_python,
+
+    }
+
+
+def read_gpg_signature(filename, signatures, sign):
+    signed_name = os.path.basename(filename) + ".asc"
+    file_to_read = None
+    if signed_name in signatures:
+        file_to_read = signatures[signed_name]
+    elif sign:
+        file_to_read = filename + ".asc"
+    if file_to_read is not None:
+        with open(file_to_read, "rb") as gpg:
+            data = (signed_name, gpg.read())
+        return data
+
+
+class Repository(object):
+    def __init__(self, config):
+        self.config = config
+        self.session = requests.Session()
+
+        parsed = urlparse(config["repository"])
+        if parsed.netloc in ["pypi.python.org", "testpypi.python.org"]:
+            config["repository"] = urlunparse(
+                ("https",) + parsed[1:]
+            )
+
+    def close(self):
+        self.session.close()
+
+    def load_credentials(self, username, password):
+        self.username = get_username(username, self.config)
+        self.password = get_password(password, self.config)
+
+    @classmethod
+    def from_config_file(cls, filename, repository):
+        # Get our config from the .pypirc file
+        try:
+            config = get_config(filename)[repository]
+        except KeyError:
+            raise KeyError(
+                "Missing '{0}' section from the configuration file".format(
+                    repository,
+                ),
+            )
+
+        return cls(config)
+
+    def upload(self, data_to_send):
+        encoder = MultipartEncoder(data_to_send)
+        resp = self.session.post(
+            self.config["repository"],
+            data=encoder,
+            auth=(self.username, self.password),
+            allow_redirects=False,
+            headers={'Content-Type': encoder.content_type},
+        )
+        # Bug 28. Try to silence a ResourceWarning by releasing the socket and
+        # clearing the connection pool.
+        resp.close()
+
+    @property
+    def url(self):
+        return self.config["repository"]
+
+
 def upload(dists, repository, sign, identity, username, password, comment,
            sign_with, config_file):
     # Check that a nonsensical option wasn't given
@@ -102,28 +235,11 @@ def upload(dists, repository, sign, identity, username, password, comment,
     )
     dists = [i for i in dists if not i.endswith(".asc")]
 
-    # Get our config from the .pypirc file
-    try:
-        config = get_config(config_file)[repository]
-    except KeyError:
-        raise KeyError(
-            "Missing '{0}' section from the configuration file".format(
-                repository,
-            ),
-        )
+    pypi_repo = Repository.from_config_file(config_file, repository)
 
-    parsed = urlparse(config["repository"])
-    if parsed.netloc in ["pypi.python.org", "testpypi.python.org"]:
-        config["repository"] = urlunparse(
-            ("https",) + parsed[1:]
-        )
+    print("Uploading distributions to {0}".format(pypi_repo.url))
 
-    print("Uploading distributions to {0}".format(config["repository"]))
-
-    username = get_username(username, config)
-    password = get_password(password, config)
-
-    session = requests.session()
+    pypi_repo.load_credentials(username, password)
 
     uploads = find_dists(dists)
 
@@ -143,87 +259,20 @@ def upload(dists, repository, sign, identity, username, password, comment,
                 os.path.basename(filename)
             )
 
-        if dtype == "bdist_egg":
-            pkgd = pkg_resources.Distribution.from_filename(filename)
-            py_version = pkgd.py_version
-        elif dtype == "bdist_wheel":
-            py_version = meta.py_version
-        elif dtype == "bdist_wininst":
-            py_version = meta.py_version
-        else:
-            py_version = None
+        data = generate_data(filename, meta, dtype, comment,
+                             action="file_upload")
+        data["md5_digest"] = generate_md5sum_from(filename)
 
-        # Fill in the data - send all the meta-data in case we need to
-        # register a new release
-        data = {
-            # action
-            ":action": "file_upload",
-            "protcol_version": "1",
-
-            # identify release
-            "name": pkg_resources.safe_name(meta.name),
-            "version": meta.version,
-
-            # file content
-            "filetype": dtype,
-            "pyversion": py_version,
-
-            # additional meta-data
-            "metadata_version": meta.metadata_version,
-            "summary": meta.summary,
-            "home_page": meta.home_page,
-            "author": meta.author,
-            "author_email": meta.author_email,
-            "maintainer": meta.maintainer,
-            "maintainer_email": meta.maintainer_email,
-            "license": meta.license,
-            "description": meta.description,
-            "keywords": meta.keywords,
-            "platform": meta.platforms,
-            "classifiers": meta.classifiers,
-            "download_url": meta.download_url,
-            "supported_platform": meta.supported_platforms,
-            "comment": comment,
-
-            # PEP 314
-            "provides": meta.provides,
-            "requires": meta.requires,
-            "obsoletes": meta.obsoletes,
-
-            # Metadata 1.2
-            "project_urls": meta.project_urls,
-            "provides_dist": meta.provides_dist,
-            "obsoletes_dist": meta.obsoletes_dist,
-            "requires_dist": meta.requires_dist,
-            "requires_external": meta.requires_external,
-            "requires_python": meta.requires_python,
-
-        }
-
-        md5_hash = hashlib.md5()
-        with open(filename, "rb") as fp:
-            content = fp.read(4096)
-            while content:
-                md5_hash.update(content)
-                content = fp.read(4096)
-
-        data["md5_digest"] = md5_hash.hexdigest()
-
-        signed_name = os.path.basename(filename) + ".asc"
-        if signed_name in signatures:
-            with open(signatures[signed_name], "rb") as gpg:
-                data["gpg_signature"] = (signed_name, gpg.read())
-        elif sign:
-            with open(filename + ".asc", "rb") as gpg:
-                data["gpg_signature"] = (signed_name, gpg.read())
+        signature_data = read_gpg_signature(filename, signatures, sign)
+        if signature_data is not None:
+            data["gpg_signature"] = signature_data
 
         print("Uploading {0}".format(os.path.basename(filename)))
 
         data_to_send = []
         for key, value in data.items():
             if isinstance(value, (list, tuple)):
-                for item in value:
-                    data_to_send.append((key, item))
+                data_to_send.extend((key, item) for item in value)
             else:
                 data_to_send.append((key, value))
 
@@ -232,18 +281,7 @@ def upload(dists, repository, sign, identity, username, password, comment,
                 "content",
                 (os.path.basename(filename), fp, "application/octet-stream"),
             ))
-            encoder = MultipartEncoder(data_to_send)
-            resp = session.post(
-                config["repository"],
-                data=encoder,
-                auth=(username, password),
-                allow_redirects=False,
-                headers={'Content-Type': encoder.content_type},
-            )
-        # Bug 28. Try to silence a ResourceWarning by releasing the socket and
-        # clearing the connection pool.
-        resp.close()
-        session.close()
+            resp = pypi_repo.upload(data_to_send)
 
         # Bug 92. If we get a redirect we should abort because something seems
         # funky. The behaviour is not well defined and redirects being issued
@@ -252,10 +290,11 @@ def upload(dists, repository, sign, identity, username, password, comment,
         if resp.is_redirect:
             raise exc.RedirectDetected(
                 ('"{0}" attempted to redirect to "{1}" during upload.'
-                 ' Aborting...').format(config["respository"],
+                 ' Aborting...').format(pypi_repo.url,
                                         resp.headers["location"]))
         # Otherwise, raise an HTTPError based on the status code.
         resp.raise_for_status()
+    pypi_repo.close()
 
 
 def main(args):
